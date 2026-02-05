@@ -1,0 +1,6 @@
+# 基础依赖
+astunparse>=1.6.3
+colorama>=0.4.6
+
+# 测试框架
+pytest>=7.4.0
