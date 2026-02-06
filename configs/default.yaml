@@ -1,0 +1,51 @@
+# PySafeScan 默认配置文件
+
+# 扫描设置
+scan:
+  recursive: true
+  ignore_hidden: true
+  follow_symlinks: false
+  max_file_size: 10485760  # 10MB
+
+# AI分析设置
+ai:
+  model: deepseek-coder
+  batch_size: 10
+  max_tokens: 2000
+  temperature: 0.1
+  timeout: 30
+
+# 漏洞规则
+rules:
+  command_injection:
+    enabled: true
+    risk_level: high
+    functions: ["os.system", "os.popen", "subprocess.call", "eval", "exec"]
+  
+  sql_injection:
+    enabled: true
+    risk_level: high
+    patterns: ["execute\\(.*\\{.*\\}.*\\)", "executemany\\(.*\\{.*\\}.*\\)"]
+  
+  path_traversal:
+    enabled: true
+    risk_level: medium
+    functions: ["open", "__import__", "execfile"]
+  
+  deserialization:
+    enabled: true
+    risk_level: high
+    modules: ["pickle", "yaml", "marshal"]
+
+# 输出设置
+output:
+  default_format: summary
+  colors: true
+  show_suggestions: true
+  max_results: 50
+
+# 排除列表
+exclude:
+  directories: [".git", "__pycache__", "node_modules", "venv", ".venv"]
+  files: ["*.pyc", "*.pyo", "*.pyd"]
+  patterns: ["test_*.py", "*_test.py"]
