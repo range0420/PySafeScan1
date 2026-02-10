@@ -142,7 +142,7 @@ def run_scan(args):
 
             # --- 新增：自动修复逻辑 ---
             # 1. 提取所有包含修复代码的高风险项
-            high_risks = [r for r in all_results if r.get('risk_level') == 'high' and r.get('fix_code')]
+            high_risks = [r for r in all_results if r.get('risk_level') in ['high','critical'] and r.get('fix_code')]
             print(f"DEBUG: 最终筛选出可修复的高风险项: {len(high_risks)} 个")
             # 2. 生成可视化报告
             generate_report(all_results)
@@ -155,23 +155,29 @@ def run_scan(args):
                 
                 choice = input("\n👉 是否进入交互式修复模式? (y/n): ").lower()
                 if choice == 'y':
-                    # 确保 core 文件夹下有 __init__.py 
-                    from core.patcher import apply_fix
+                    from core.patcher import apply_fix_in_memory
+    
+                    # 1. 首先读取文件的当前内容到变量
+                    high_risks.sort(key=lambda x: x['line'], reverse=True)
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_buffer = f.read()
+
+                    # 2. 迭代修复
                     for r in high_risks:
-                        print(f"\n📍 位置: {r.get('file')}:{r.get('line')}")
-                        print(f"❌ 原始代码: {r.get('api')}")
-                        print(f"✅ 建议修复: {r.get('fix_code')}")
-                        
-                        if input("🛠️  生成修复后的文件? (y/n): ").lower() == 'y':
-                            new_file = apply_fix(
-                                r['file'], 
-                                r['line'], 
-                                r['api'], 
-                                r['fix_code'],
-                                full_context=r.get('full_context'),
-                                is_block_fix=r.get('is_block_fix', False)
-        )
-                            print(f"✨ 修复完成！请查看新文件: {new_file}")
+                        print(f"📍 正在内存中应用修复(倒序): {r['vulnerability']} at line {r['line']}")
+                        # 核心逻辑：这里需要修改 apply_fix，让它支持传入字符串内容并返回修改后的字符串
+                        file_buffer = apply_fix_in_memory(
+                            file_buffer, 
+                            r['line'], 
+                            r['full_context'], 
+                            r['fix_code'],
+                            is_block_fix=r.get('is_block_fix', False)
+                        )
+                    fixed_path = f"{file_path}.fixed"
+                    # 3. 最后一次性保存
+                    with open(fixed_path, 'w', encoding='utf-8') as f:
+                        f.write(file_buffer)
+                    print(f"✨ 累积修复完成！所有高风险漏洞已整合至: {fixed_path}")
                 else:
                     print("⏭️ 已跳过自动修复步骤。")
 
