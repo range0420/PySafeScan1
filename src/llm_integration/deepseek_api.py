@@ -122,16 +122,17 @@ class DeepSeekSecurityAnalyzer:
             api_details.append(detail)
         formatted_apis = "\n\n---\n\n".join(api_details)
 
-        prompt = f"""你是一个顶尖的Python安全专家。请分析代码中的API安全风险并提供深度重构方案。
+        prompt = f"""你是一个顶尖的Python安全专家。请分析以下代码中的API安全风险并提供深度重构方案。
 
 ### 审计目标：
-1. 识别危险的API调用（如 SQL注入、命令注入）。
-2. **执行变量追踪**：观察 API 参数的来源。如果参数是由前面的字符串拼接（f-string 或 +）生成的，请将该拼接过程也纳入修复范围。
+1. 识别危险的API调用（如 SQL注入、路径穿越、命令注入）。
+2. **执行变量追踪**：如果 Sink 点的参数源于之前的字符串拼接（f-string, +, %），必须重构整个逻辑链。
 
-### 修复要求：
-- 如果漏洞涉及变量拼接，请在 "fix_code" 中提供**重构后的完整逻辑**，而不仅仅是单行调用。
-- 确保修复后的代码不再依赖原有的危险拼接变量。
-- 保持原有的缩进格式。
+### 修复要求（至关重要）：
+- **不要返回函数定义行**：例如，不要返回 "def func():"，只需返回函数内部经过修复的逻辑。
+- **自包含修复**：如果修复方案需要用到新的库（如 subprocess, urllib.parse, shlex），请将 `import` 语句包含在 "fix_code" 的顶部。
+- **逻辑完整性**：在 "fix_code" 中提供能够替换掉原代码中从“拼接变量”到“API调用”这一整块的逻辑。
+- **缩进标准**：逻辑体统一使用 4 空格缩进，不要带额外的层级偏置，Patcher 会自动对齐。
 
 ### 待分析列表：
 {formatted_apis}
@@ -140,12 +141,12 @@ class DeepSeekSecurityAnalyzer:
 {{
   "apis": [
     {{
-      "api": "run_query(conn, sql)",
-      "category": "sink",
+      "api": "os.system(cmd)",
+      "line": 15,
       "risk_level": "high",
-      "vulnerability": "sql_injection",
-      "suggestion": "检测到变量 sql 存在拼接风险。建议删除 sql 变量定义，直接使用参数化查询重构。",
-      "fix_code": "    conn = sqlite3.connect('app.db')\n    run_query(conn, 'SELECT * FROM users WHERE id = ?', (user_input,))",
+      "vulnerability": "command_injection",
+      "suggestion": "变量 cmd 是通过 f-string 拼接的，存在严重注入风险。建议使用 subprocess.run 并传递参数列表。",
+      "fix_code": "import subprocess\\nimport shlex\\n# 修复逻辑：\\nargs = ['ls', user_input]\\nsubprocess.run(args, check=True)",
       "is_block_fix": true
     }}
   ]

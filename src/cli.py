@@ -154,30 +154,69 @@ def run_scan(args):
                 print("🔧"*20)
                 
                 choice = input("\n👉 是否进入交互式修复模式? (y/n): ").lower()
-                if choice == 'y':
-                    from core.patcher import apply_fix_in_memory
-    
-                    # 1. 首先读取文件的当前内容到变量
-                    high_risks.sort(key=lambda x: x['line'], reverse=True)
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_buffer = f.read()
 
-                    # 2. 迭代修复
+                if choice.lower() == 'y':
+                    # 必须在此处导入
+                    from core.patcher import apply_fix_in_memory
+                    import core.patcher as patcher_mod
+
+                    # 重置锁
+                    if hasattr(patcher_mod, '_fixed_scopes'):
+                        patcher_mod._fixed_scopes.clear()
+
+                    # 按文件归类
+                    files_to_fix = {}
                     for r in high_risks:
-                        print(f"📍 正在内存中应用修复(倒序): {r['vulnerability']} at line {r['line']}")
-                        # 核心逻辑：这里需要修改 apply_fix，让它支持传入字符串内容并返回修改后的字符串
-                        file_buffer = apply_fix_in_memory(
-                            file_buffer, 
-                            r['line'], 
-                            r['full_context'], 
-                            r['fix_code'],
-                            is_block_fix=r.get('is_block_fix', False)
-                        )
-                    fixed_path = f"{file_path}.fixed"
-                    # 3. 最后一次性保存
-                    with open(fixed_path, 'w', encoding='utf-8') as f:
-                        f.write(file_buffer)
-                    print(f"✨ 累积修复完成！所有高风险漏洞已整合至: {fixed_path}")
+                        f_path = r.get('file') or r.get('filename')
+                        if f_path:
+                            if f_path not in files_to_fix: files_to_fix[f_path] = []
+                            files_to_fix[f_path].append(r)
+
+                    for f_path, issues in files_to_fix.items():
+                        try:
+                            print(f"📍 正在修复文件: {f_path}")
+                            with open(f_path, 'r', encoding='utf-8') as f:
+                                current_file_content = f.read()
+
+                            # 关键：从下往上修，保证行号相对稳定
+                            issues.sort(key=lambda x: x.get('line', 0), reverse=True)
+
+                            for issue in issues:
+                                print(f"  └─ 执行原子修复: {issue.get('function', 'Global')} (第 {issue.get('line')} 行)")
+                                current_file_content = apply_fix_in_memory(
+                                    current_file_content,
+                                    issue.get('line', 0),
+                                    issue.get('full_context', ''),
+                                    issue.get('fix_code', ''),
+                                    is_block_fix=True,
+                                    target_func_name=issue.get('function')
+                                )
+
+                            # --- 自动补全 Imports ---
+                            needed_libs = {
+                                "json": "import json",
+                                "ast": "import ast",
+                                "shlex": "import shlex"
+                            }
+                            new_imports = []
+                            for lib, statement in needed_libs.items():
+                                if f"{lib}." in current_file_content and statement not in current_file_content:
+                                    new_imports.append(statement)
+                            
+                            if new_imports:
+                                current_file_content = "\n".join(new_imports) + "\n" + current_file_content
+
+                            # --- 物理写入 ---
+                            fixed_path = f"{f_path}.fixed"
+                            with open(fixed_path, 'w', encoding='utf-8') as f:
+                                f.write(current_file_content)
+                            print(f"  ✅ 修复文件已生成: {fixed_path}")
+
+                        except Exception as e:
+                            print(f"  ❌ 修复文件 {f_path} 时出错: {e}")
+
+                    print(f"\n🎉 批量修复任务完成！共处理 {len(files_to_fix)} 个文件。")
+                
                 else:
                     print("⏭️ 已跳过自动修复步骤。")
 
