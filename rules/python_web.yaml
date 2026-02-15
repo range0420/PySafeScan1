@@ -1,0 +1,20 @@
+# 核心检测规格定义
+COMMAND_INJECTION:
+  sinks: ["os.system", "subprocess.run", "subprocess.Popen", "os.popen"]
+  sanitizers: ["shlex.quote", "int", "float"]
+  desc: "命令注入：外部数据直接控制系统 Shell 命令，风险极高。"
+
+SQL_INJECTION:
+  sinks: ["execute", "executemany", "read_sql"]
+  sanitizers: ["int", "str.isdigit"]
+  desc: "SQL 注入：恶意 SQL 片段破坏数据库查询结构。"
+
+PATH_TRAVERSAL:
+  sinks: ["open", "os.remove", "os.listdir", "pathlib.Path"]
+  sanitizers: ["os.path.basename", "secure_filename"]
+  desc: "路径穿越：攻击者尝试访问或操作预设目录之外的文件。"
+
+SSRF:
+  sinks: ["requests.get", "requests.post", "urllib.request.urlopen"]
+  sanitizers: []
+  desc: "服务端请求伪造：服务器被诱导向内网发起非法请求。"
