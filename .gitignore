@@ -1,66 +1,7 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyCharm
-.idea/
-*.iml
-*.ipr
-*.iws
-
-# VSCode
-.vscode/
-*.code-workspace
-
-# Environment
 venv/
+__pycache__/
+*.pyc
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Test and coverage
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
+audit_log.txt
+AUDIT_REPORT.md
 .pytest_cache/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# macOS
-.DS_Store
-
-# Backup files
-*.bak
-*.backup
-*.tmp
-
-# Project specific
-backups/
-*.report.json
-demo_*.py
-test_*.py

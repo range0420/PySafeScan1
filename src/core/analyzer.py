@@ -1,107 +1,102 @@
 import ast
-import os
-from src.core.spec import SECURITY_SPECS, POTENTIAL_SOURCES
+import re
 
-class IrisPowerSlicer:
-    def __init__(self, tree, source_code):
-        self.tree = tree
+class UniversalTaintAnalyzer(ast.NodeVisitor):
+    def __init__(self, source_code):
+        self.source_code = source_code
         self.lines = source_code.splitlines()
+        self.tainted_vars = {}  # 修改为字典：变量名 -> 定义处的代码行
+        self.potentials = []
+        self.sanitizers = {'escape', 'quote', 'int', 'float', 'hex', 'strip'}
 
-    def extract_vars(self, node):
-        """深度提取变量、属性和字典访问"""
-        v = set()
-        for n in ast.walk(node):
-            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
-                v.add(n.id)
-            elif isinstance(n, (ast.Attribute, ast.Subscript)):
-                v.add(ast.unparse(n))
-        return v
+    def _get_full_name(self, node):
+        if isinstance(node, ast.Name): return node.id
+        if isinstance(node, ast.Attribute):
+            return f"{self._get_full_name(node.value)}.{node.attr}"
+        return ""
 
-    def is_dangerous_call(self, node):
-        """精准 Sink 匹配：支持参数过滤（如 shell=True）"""
-        try:
-            call_name = ast.unparse(node.func)
-        except: return False, None
+    def is_generalized_source(self, node):
+        full_name = self._get_full_name(node)
+        patterns = ['request.', 'cookie', 'header', 'environ', 'payload', 'data', 'input', 'argv']
+        return any(p in full_name.lower() for p in patterns)
+
+    def get_taint_reason(self, node):
+        """递归检查并返回导致污染的根源描述"""
+        if node is None: return None
+        if isinstance(node, ast.Name) and node.id in self.tainted_vars:
+            return f"variable '{node.id}' (defined at line {self.tainted_vars[node.id]})"
+        if self.is_generalized_source(node):
+            return f"external source '{self._get_full_name(node)}'"
+        if isinstance(node, (ast.BinOp, ast.JoinedStr, ast.Call)):
+            # 简化逻辑：只要子节点有毒就返回
+            for child in ast.iter_child_nodes(node):
+                reason = self.get_taint_reason(child)
+                if reason: return reason
+        return None
+
+    def visit_Assign(self, node):
+        reason = self.get_taint_reason(node.value)
+        for target in node.targets:
+            t_name = None
+            if isinstance(target, ast.Name): t_name = target.id
+            elif isinstance(target, (ast.Subscript, ast.Attribute)) and isinstance(target.value, ast.Name):
+                t_name = target.value.id
+            
+            if t_name:
+                if reason:
+                    self.tainted_vars[t_name] = node.lineno
+                else:
+                    self.tainted_vars.pop(t_name, None)
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        reason = self.get_taint_reason(node)
+        if reason:
+            func_name = self._get_full_name(node.func)
+            safe_builtins = {'print', 'len', 'type', 'isinstance', 'str', 'append'}
+            if func_name.lower() not in safe_builtins:
+                # 关键改进：不仅给当前行，还要给污染源定义行
+                source_line = 0
+                for arg in node.args:
+                    if isinstance(arg, ast.Name) and arg.id in self.tainted_vars:
+                        source_line = self.tainted_vars[arg.id]
+
+                self.potentials.append({
+                    'line': node.lineno,
+                    'type': 'Taint_Propagation_Risk',
+                    'spec': f"Data from {reason} reached sink '{func_name}'",
+                    'slice': self._build_smart_slice(source_line, node.lineno)
+                })
+        self.generic_visit(node)
+
+    def _build_smart_slice(self, start_line, end_line):
+        """跨行切片：让 AI 同时看到污点定义和 Sink 调用"""
+        lines = []
+        if start_line > 0:
+            lines.append(f"--- [Taint Source Line {start_line}] ---")
+            lines.append(self.lines[max(0, start_line-1)])
+            lines.append("...")
         
-        # 特殊逻辑：针对 subprocess 的参数感知
-        if "subprocess" in call_name:
-            is_shell_true = any(
-                kw.arg == 'shell' and isinstance(kw.value, ast.Constant) and kw.value.value is True 
-                for kw in node.keywords
-            )
-            if not is_shell_true: return False, None
+        lines.append(f"--- [Sink Execution Line {end_line}] ---")
+        start = max(0, end_line - 3)
+        end = min(len(self.lines), end_line + 2)
+        lines.extend(self.lines[start:end])
+        return "\n".join(lines)
 
-        for v_type, spec in SECURITY_SPECS.items():
-            if any(sink in call_name for sink in spec['sinks']):
-                return True, (v_type, spec)
-        return False, None
-
-    def get_slice(self, sink_node, spec):
-        """终极切片算法：追踪、洗白、逻辑捕获"""
-        path_slice = []
-        target_taints = self.extract_vars(sink_node)
-        
-        # 逆序扫描 AST 节点
-        nodes = sorted(list(ast.walk(self.tree)), key=lambda x: getattr(x, 'lineno', 0), reverse=True)
-
-        for node in nodes:
-            if not hasattr(node, 'lineno') or node.lineno >= sink_node.lineno:
-                continue
-
-            # 1. 赋值与洗白追踪
-            if isinstance(node, ast.Assign):
-                targets = {ast.unparse(t) for t in node.targets}
-                if targets & target_taints:
-                    # 常量覆盖洗白 (Killer Assignment)
-                    if isinstance(node.value, (ast.Constant, ast.Num, ast.Str)):
-                        path_slice.insert(0, f"[CLEAN] 常量覆盖(洗白): {ast.unparse(node)}")
-                        target_taints -= targets
-                        continue
-                    
-                    # 净化器过滤
-                    if isinstance(node.value, ast.Call) and any(s in ast.unparse(node.value.func) for s in spec['sanitizers']):
-                        path_slice.insert(0, f"[SAFE] 净化器拦截: {ast.unparse(node)}")
-                        target_taints -= targets
-                        continue
-                    
-                    path_slice.insert(0, f"Line {node.lineno}: {self.lines[node.lineno-1].strip()}")
-                    target_taints -= targets
-                    target_taints.update(self.extract_vars(node.value))
-
-            # 2. 外部引入感知 (Import)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                path_slice.insert(0, f"[IMPORT] 外部定义: {ast.unparse(node)}")
-
-            # 3. 逻辑校验点
-            elif isinstance(node, (ast.If, ast.Assert)):
-                if self.extract_vars(node.test) & target_taints:
-                    path_slice.insert(0, f"[LOGIC] 校验逻辑: {ast.unparse(node.test)}")
-
-            # 4. 污染源识别 (Source)
-            elif isinstance(node, ast.Call):
-                if any(src in ast.unparse(node) for src in POTENTIAL_SOURCES):
-                    path_slice.insert(0, f"[SOURCE] 污染源确认: {ast.unparse(node)}")
-
-        path_slice.append(f"[SINK] 危险点执行: {ast.unparse(sink_node)}")
-        return path_slice
-
-def analyze_file(file_path):
-    if not os.path.exists(file_path): return []
-    with open(file_path, "r", encoding="utf-8") as f:
-        source = f.read()
+def analyze_file(filepath):
     try:
-        tree = ast.parse(source)
-    except: return []
+        with open(filepath, 'r', encoding='utf-8') as f:
+            code = f.read()
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            # 强化版翻译：处理更多嵌套情况
+            code = re.sub(r'f"(.*?)\{(.*?)\}(.*?)"', r'("\1" + str(\2) + "\3")', code)
+            code = re.sub(r"f'(.*?)\{(.*?)\}(.*?)'", r"('\1' + str(\2) + '\3')", code)
+            tree = ast.parse(code)
 
-    slicer = IrisPowerSlicer(tree, source)
-    results = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            is_danger, spec_info = slicer.is_dangerous_call(node)
-            if is_danger:
-                v_type, spec = spec_info
-                trace = slicer.get_slice(node, spec)
-                # 只有包含 SOURCE 的路径才有审计价值
-                if any("[SOURCE]" in step for step in trace):
-                    results.append({'type': v_type, 'spec': spec, 'slice': trace, 'line': node.lineno})
-    return results
+        analyzer = UniversalTaintAnalyzer(code)
+        analyzer.visit(tree)
+        return analyzer.potentials
+    except Exception:
+        return []
