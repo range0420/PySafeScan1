@@ -1,7 +1,85 @@
-venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pythonenv.*
+
+# 虚拟环境
+venv/
+env/
 .env
-audit_log.txt
-AUDIT_REPORT.md
-.pytest_cache/
+.venv
+
+# 缓存目录
+cache/
+.cache
+*.cache
+.codeql_workspace/
+
+# 输出文件
+output/
+logs/
+*.log
+*.sarif
+*.db
+*.results
+*.json
+!config.json
+!requirements.json
+
+# 测试临时文件
+tests_temp/
+iris_test_project/
+*.test
+*.tmp
+
+# CodeQL
+codeql-home/
+codeql-workspace/
+*.qlpack
+*.qll
+!queries/*.ql
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# API密钥配置
+config_local.py
+*.key
+*.pem
+
+# 基准测试结果（如果太大）
+tests/BenchmarkPython/results/
+!tests/BenchmarkPython/results/.gitkeep
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.temp
+
+# 操作系统
+Thumbs.db
+ehthumbs.db
+Desktop.ini

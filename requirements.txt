@@ -1,10 +1,33 @@
-# 基础依赖
-astunparse>=1.6.3
-colorama>=0.4.6
+# 核心依赖
+openai>=1.0.0
+python-dotenv>=1.0.0
 
-# 测试框架
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 并发处理
+concurrent-futures>=3.0.0
+
+# 日志和调试
+loguru>=0.7.0
+
+# 测试
 pytest>=7.4.0
-networkx>=3.0
-plotly>=5.0
-pandas>=2.0
-kaleido>=0.1
+pytest-cov>=4.1.0
+
+# 代码分析
+astroid>=3.0.0
+
+# Web界面（可选）
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# 性能监控
+psutil>=5.9.0
+
+# 序列化
+orjson>=3.9.0
+
+# 缓存
+redis>=5.0.0  # 可选，用于分布式缓存
