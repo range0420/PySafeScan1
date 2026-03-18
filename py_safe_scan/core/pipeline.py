@@ -59,26 +59,13 @@ class IRISPipeline:
             "start_time": None,
             "end_time": None
         }
-        # 新增：多级缓存
-        self.path_cache = {}  # 路径验证结果缓存
-        self.fp_sources = set()  # 已知误报的source
-        self.fp_sinks = set()    # 已知误报的sink
-        self.batch_size = 3  # 批处理大小
-
-    def _get_path_key(self, vuln: Dict) -> str:
-        """生成路径key用于缓存 - IRIS方式"""
-        source = vuln.get("source", {})
-        source_file = source.get("file", "unknown")
-        source_line = source.get("line", 0)
-        
-        sink_file = vuln.get("file", "unknown")
-        sink_line = vuln.get("line", 0)
-        
-        # 获取消息的前50字符作为指纹
-        msg = vuln.get("message", "")[:50]
-        
-        # IRIS方式：source->sink:message
-        return f"{source_file}:{source_line}->{sink_file}:{sink_line}:{msg}"
+        # 新增：三级缓存
+        self.path_cache = {}          # 路径验证结果缓存
+        self.source_cache = set()      # 已知安全的source
+        self.sink_cache = set()        # 已知安全的sink
+        self.fp_sources = set()        # 已知误报的source
+        self.fp_sinks = set()          # 已知误报的sink
+        self.batch_size = 10            # 批处理大小
 
     def _heuristic_filter(self, vuln: Dict) -> bool:
         """启发式过滤：判断是否应该跳过此路径"""
@@ -479,132 +466,146 @@ dependencies:
 
 
     def _validate_paths(self, vulnerabilities: List[Dict]) -> List[Dict]:
-        """验证漏洞路径 - IRIS多级过滤系统"""
+        """验证漏洞路径 - IRIS方式：每组只验证一次"""
         if not vulnerabilities:
             return []
-        
-        # ============ 第1层：启发式过滤 ============
-        filtered = []
+
+        from collections import defaultdict
+
+        # ============ 第1层：按真实source-sink对聚类 ============
+        path_groups = defaultdict(list)
         for vuln in vulnerabilities:
-            if not self._heuristic_filter(vuln):
-                filtered.append(vuln)
-        
-        # ============ 第2层：快速规则检查 ============
-        rule_filtered = []
-        for vuln in filtered:
-            if not self._quick_rule_check(vuln):
-                rule_filtered.append(vuln)
-        
-        # ============ 第3层：已知误报检查 ============
-        fp_filtered = []
-        for vuln in rule_filtered:
-            source = vuln.get("source", {})
-            source_key = f"{source.get('file')}:{source.get('line')}"
-            sink_key = f"{vuln.get('file')}:{vuln.get('line')}"
+            # 从path中找真实source
+            path = vuln.get("path", [])
+            real_source = "unknown:0"
+            for node in path:
+                node_msg = node.get("message", "")
+                if any(key in node_msg for key in ["request", "cookies", "args", "get", "param"]):
+                    real_source = f"{node.get('file')}:{node.get('line')}"
+                    break
             
-            if source_key not in self.fp_sources and sink_key not in self.fp_sinks:
-                fp_filtered.append(vuln)
-        
-        logger.info(f"过滤统计: 原始{len(vulnerabilities)} → 启发式{len(filtered)} → 规则{len(rule_filtered)} → FP过滤{len(fp_filtered)}")
-        
-        # ============ IRIS方式：三级缓存 + 批量验证 ============
+            sink_file = vuln.get("file", "")
+            sink_line = vuln.get("line", 0)
+            group_key = f"{real_source}->{sink_file}:{sink_line}"
+            path_groups[group_key].append(vuln)
+
+        print(f"\n聚类前: {len(vulnerabilities)}条, 聚类后: {len(path_groups)}组")
+
+        # ============ 第2层：每组只验证一次 ============
         confirmed = []
-        batch = []
         cache_hits = 0
         
-        # 用于记录已经处理过的source-sink对（最终去重）
-        seen_pairs = set()
-        
-        for vuln in fp_filtered:
-            # 生成缓存key
-            key = self._get_path_key(vuln)
+        for group_key, group in path_groups.items():
+            # 取组内第一条作为代表
+            rep_vuln = group[0]
             
-            # 检查 grouped_path_cache
-            if key in self.path_cache:
-                if self.path_cache[key].get("is_vulnerable", False):
-                    # 检查是否已经添加过相同的source-sink对
-                    source = vuln.get("source", {})
-                    sink_file = vuln.get("file", "")
-                    sink_line = vuln.get("line", 0)
-                    pair_key = f"{source.get('file')}:{source.get('line')}->{sink_file}:{sink_line}"
-                    
-                    print(f"缓存命中: {pair_key} - 行号 {sink_line}")
-                    
-                    # 只保留真正的危险操作（根据行号判断，第47行是真正的open调用）
-                    if sink_line == 47:
-                        if pair_key not in seen_pairs:
-                            seen_pairs.add(pair_key)
-                            self._enrich_vulnerability(vuln, self.path_cache[key])
-                            confirmed.append(vuln)
-                    else:
-                        print(f"忽略非危险操作: {pair_key} - 行号 {sink_line}")
-                cache_hits += 1
+            # 检查source/sink缓存
+            source = rep_vuln.get("source", {})
+            sink_file = rep_vuln.get("file", "")
+            sink_line = rep_vuln.get("line", 0)
+            source_key = f"{source.get('file')}:{source.get('line')}"
+            sink_key = f"{sink_file}:{sink_line}"
+            
+            if source_key in self.source_cache or sink_key in self.sink_cache:
+                print(f"跳过已知误报: {group_key}")
                 continue
             
-            batch.append(vuln)
+            # 检查路径缓存
+            cache_key = self._get_path_key(rep_vuln)
+            if cache_key in self.path_cache:
+                if self.path_cache[cache_key].get("is_vulnerable", False):
+                    # 整组都算确认
+                    confirmed.extend(group)
+                cache_hits += 1
+                print(f"缓存命中: {group_key}")
+                continue
             
-            # 批处理
-            if len(batch) >= self.batch_size:
-                batch_results = self._validate_batch(batch)
-                
-                # 对批量结果进行最终去重
-                for result_vuln in batch_results:
-                    source = result_vuln.get("source", {})
-                    sink_file = result_vuln.get("file", "")
-                    sink_line = result_vuln.get("line", 0)
-                    pair_key = f"{source.get('file')}:{source.get('line')}->{sink_file}:{sink_line}"
-                    
-                    print(f"新结果: {pair_key} - 行号 {sink_line}")
-                    
-                    # 只保留真正的危险操作（根据行号判断，第47行是真正的open调用）
-                    if sink_line == 47:
-                        if pair_key not in seen_pairs:
-                            seen_pairs.add(pair_key)
-                            confirmed.append(result_vuln)
-                    else:
-                        print(f"忽略非危险操作: {pair_key} - 行号 {sink_line}")
-                
-                batch = []
-        
-        # 处理剩余的
-        if batch:
-            batch_results = self._validate_batch(batch)
-            for result_vuln in batch_results:
-                source = result_vuln.get("source", {})
-                sink_file = result_vuln.get("file", "")
-                sink_line = result_vuln.get("line", 0)
-                pair_key = f"{source.get('file')}:{source.get('line')}->{sink_file}:{sink_line}"
-                
-                print(f"最后批次: {pair_key} - 行号 {sink_line}")
-                
-                # 只保留真正的危险操作（根据行号判断，第47行是真正的open调用）
-                if sink_line == 47:
-                    if pair_key not in seen_pairs:
-                        seen_pairs.add(pair_key)
-                        confirmed.append(result_vuln)
-                else:
-                    print(f"忽略非危险操作: {pair_key} - 行号 {sink_line}")
+            # 验证代表路径
+            print(f"验证代表: {group_key}")
+            result = self._validate_single(rep_vuln)
+            
+            # 保存缓存
+            self.path_cache[cache_key] = {"is_vulnerable": result.get("is_vulnerable", False)}
+            
+            if result.get("is_vulnerable", False):
+                # 整组都算确认
+                confirmed.extend(group)
+            else:
+                # 记录误报，整组跳过
+                self.source_cache.add(source_key)
+                self.sink_cache.add(sink_key)
         
         self.stats["cache_hits"] = cache_hits
-        logger.info(f"缓存命中: {cache_hits}, 最终确认: {len(confirmed)}")
-        
-        print(f"\n最终去重: {len(confirmed)} 条")
-        for i, v in enumerate(confirmed):
-            source = v.get("source", {})
-            print(f"  {i+1}. {source.get('file')}:{source.get('line')} -> {v.get('file')}:{v.get('line')}")
+        print(f"缓存命中: {cache_hits}, 最终确认: {len(confirmed)}")
         
         return confirmed
 
+    def _validate_single(self, vuln: Dict) -> Dict:
+        """验证单个漏洞路径"""
+        source, source_context = self._extract_source_info(vuln)
+        sink_context = self._extract_sink_info(vuln)
+        
+        path = vuln.get("path", [])
+        
+        code_snippets = {
+            "source": source_context,
+            "sink": sink_context
+        }
+        
+        result = self.deepseek.validate_vulnerability_path(
+            source=source,
+            sink=source,
+            path=path,
+            cwe_type=self.cwe_type or vuln.get("cwe", "unknown"),
+            code_snippets=code_snippets
+        )
+        
+        self.stats["llm_calls"] += 1
+        return result
+
+    def _get_path_key(self, vuln: Dict) -> str:
+        """生成路径缓存key"""
+        source = vuln.get("source", {})
+        source_file = source.get("file", "unknown")
+        source_line = source.get("line", 0)
+        
+        sink_file = vuln.get("file", "unknown")
+        sink_line = vuln.get("line", 0)
+        
+        msg = vuln.get("message", "")[:50]
+        
+        return f"{source_file}:{source_line}->{sink_file}:{sink_line}:{msg}"
+
     def _validate_batch(self, batch: List[Dict]) -> List[Dict]:
-        """批量验证一组漏洞"""
+        """批量验证一组漏洞 - 带缓存"""
         if not batch:
             return []
         
-        confirmed = []
+        print(f"\n验证批次，大小 {len(batch)}")
+        for i, vuln in enumerate(batch):
+            code = vuln.get("code", "")
+            line = vuln.get("line", 0)
+            print(f"  vuln {i}: line={line}, code={code[:100]}")
+        
+        results = []
         
         for vuln in batch:
             key = self._get_path_key(vuln)
             
+            # ============ 检查缓存 ============
+            if key in self.path_cache:
+                cached = self.path_cache[key]
+                result_vuln = vuln.copy()
+                result_vuln["is_vulnerable"] = cached.get("is_vulnerable", False)
+                result_vuln["confidence"] = cached.get("confidence", 0)
+                result_vuln["explanation"] = cached.get("explanation", "")
+                result_vuln["recommendation"] = cached.get("recommendation", "")
+                results.append(result_vuln)
+                self.stats["cache_hits"] += 1
+                print(f"  缓存命中: line={line}, is_vulnerable={cached.get('is_vulnerable', False)}")
+                continue
+            
+            # ============ 缓存未命中，调用LLM ============
             # 提取source和sink信息
             source, source_context = self._extract_source_info(vuln)
             sink_context = self._extract_sink_info(vuln)
@@ -627,19 +628,27 @@ dependencies:
             
             self.stats["llm_calls"] += 1
             
-            # 保存缓存
+            # 保存到缓存
             self.path_cache[key] = validation_result
             
+            # 创建结果对象
+            result_vuln = vuln.copy()
+            result_vuln["is_vulnerable"] = validation_result.get("is_vulnerable", False)
+            result_vuln["confidence"] = validation_result.get("confidence", 0)
+            result_vuln["explanation"] = validation_result.get("explanation", "")
+            result_vuln["recommendation"] = validation_result.get("recommendation", "")
+            
             if validation_result.get("is_vulnerable", False) and validation_result.get("confidence", 0) > 70:
-                self._enrich_vulnerability(vuln, validation_result)
-                confirmed.append(vuln)
+                self._enrich_vulnerability(result_vuln, validation_result)
             else:
                 # 记录误报的source/sink
                 source = vuln.get("source", {})
                 self.fp_sources.add(f"{source.get('file')}:{source.get('line')}")
                 self.fp_sinks.add(f"{vuln.get('file')}:{vuln.get('line')}")
+            
+            results.append(result_vuln)
         
-        return confirmed
+        return results
 
     
     def _extract_source_info(self, vuln: Dict) -> tuple:
