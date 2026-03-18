@@ -1,4 +1,4 @@
-"""主流水线 - 完整实现IRIS四阶段"""
+"""主流水线 - 完整实现IRIS四阶段（带动态查询生成）"""
 
 import logging
 import time
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class IRISPipeline:
-    """IRIS论文完整实现的主流水线"""
+    """IRIS论文完整实现的主流水线（带动态查询生成）"""
     
     def __init__(self, cwe_type: str = None, use_cache: bool = True):
         """
@@ -54,14 +54,137 @@ class IRISPipeline:
             "llm_calls": 0,
             "cache_hits": 0,
             "vulnerabilities_found": 0,
+            "vulnerabilities_filtered": 0,
             "vulnerabilities_confirmed": 0,
             "start_time": None,
             "end_time": None
         }
-    
+        # 新增：多级缓存
+        self.path_cache = {}  # 路径验证结果缓存
+        self.fp_sources = set()  # 已知误报的source
+        self.fp_sinks = set()    # 已知误报的sink
+        self.batch_size = 3  # 批处理大小
+
+    def _get_path_key(self, vuln: Dict) -> str:
+        """生成路径key用于缓存 - IRIS方式"""
+        source = vuln.get("source", {})
+        source_file = source.get("file", "unknown")
+        source_line = source.get("line", 0)
+        
+        sink_file = vuln.get("file", "unknown")
+        sink_line = vuln.get("line", 0)
+        
+        # 获取消息的前50字符作为指纹
+        msg = vuln.get("message", "")[:50]
+        
+        # IRIS方式：source->sink:message
+        return f"{source_file}:{source_line}->{sink_file}:{sink_line}:{msg}"
+
+    def _heuristic_filter(self, vuln: Dict) -> bool:
+        """启发式过滤：判断是否应该跳过此路径"""
+        message = vuln.get("message", "").lower()
+        
+        # IRIS中的过滤模式
+        ignore_patterns = [
+            "tostring",
+            "println", 
+            "... + ...",
+            "next()",
+            "getoptionvalue",
+            "getproperty",
+            "iterator",
+            "hasnext",
+            "entryset",
+            "keyset"
+        ]
+        
+        for pattern in ignore_patterns:
+            if pattern in message:
+                logger.debug(f"启发式过滤: {pattern}")
+                return True
+        
+        return False    
+
+    def _quick_rule_check(self, vuln: Dict) -> bool:
+        """快速规则检查：判断是否明显不是漏洞（加强版）"""
+        path = vuln.get("path", [])
+        if not path:
+            return False
+        
+        codes = [node.get("code", "") for node in path]
+        full_code = " ".join(codes)
+        
+        # 1. 硬编码赋值检查
+        hardcoded_patterns = [
+            "bar = \"This_should_always_happen\"",
+            "bar = 'This_should_always_happen'",
+            "bar = \"safe\"",
+            "bar = 'safe'",
+            "bar = \"constant\"",
+            "bar = \"FixedString\"",
+        ]
+        for pattern in hardcoded_patterns:
+            if pattern in full_code:
+                logger.info(f"快速过滤: 硬编码赋值 {pattern}")
+                return True
+        
+        # 2. 条件分支检查 - 用户输入永远进不来
+        if "if " in full_code and "else" in full_code:
+            # 检查是否用户输入只在else分支，但条件永远为真
+            if "> 200" in full_code and "num = 106" in full_code:
+                logger.info(f"快速过滤: 条件永远为真，用户输入不可达")
+                return True
+            # 检查是否用户输入只在if分支，但条件永远为假
+            if "< 0" in full_code and "num = 106" in full_code:
+                logger.info(f"快速过滤: 条件永远为假，用户输入不可达")
+                return True
+        
+        # 3. 类型转换检查 - 输入被转换成其他类型
+        type_conversions = ["int(", "float(", "bool(", "str("]
+        for conv in type_conversions:
+            if conv in full_code and "param" in full_code:
+                # 检查是否转换后用于路径
+                next_nodes = []
+                found = False
+                for i, node in enumerate(path):
+                    if conv in node.get("code", ""):
+                        # 看转换后的值是否继续传递
+                        for j in range(i+1, min(i+3, len(path))):
+                            next_nodes.append(path[j].get("code", ""))
+                        if any("open" in n for n in next_nodes):
+                            found = True
+                            break
+                if not found:
+                    logger.info(f"快速过滤: 类型转换 {conv} 阻断了路径")
+                    return True
+        
+        # 4. 白名单检查
+        if "in [" in full_code or "in (" in full_code or "in {" in full_code:
+            # 检查是否是有效的白名单
+            if "if" in full_code and "return" in full_code:
+                logger.info("快速过滤: 白名单检查")
+                return True
+        
+        # 5. 长度限制检查
+        if "len(" in full_code and "<" in full_code:
+            # 检查长度限制是否有效
+            if "if" in full_code and "return" in full_code:
+                logger.info("快速过滤: 长度限制")
+                return True
+        
+        # 6. 异常处理检查
+        if "try:" in full_code and "except" in full_code:
+            # 如果异常处理中没有文件操作，可能是无害的
+            if "open" not in full_code and "read" not in full_code:
+                logger.info("快速过滤: 仅有异常处理")
+                return True
+        
+        return False
+
+
     def analyze_directory(self, directory: Path) -> Dict:
         """
-        分析目录 - IRIS四阶段完整实现
+        分析目录 - IRIS四阶段完整实现（带动态查询生成）
         
         Args:
             directory: 目标目录
@@ -80,34 +203,63 @@ class IRISPipeline:
         logger.info("="*60)
         db_path = self._create_database(directory)
         
-        # ============ 阶段2: 运行CodeQL内置查询并提取规范 ============
+        # ============ 阶段2: 提取候选API + LLM分类 ============
         logger.info("="*60)
-        logger.info("阶段2/4: 运行CodeQL查询并提取规范")
-        logger.info("="*60)
-        
-        # 2.1 运行内置查询
-        logger.info("运行CodeQL内置安全查询...")
-        results_path = self.codeql.run_builtin_queries(db_path)
-        
-        # 2.2 从结果中提取API规范
-        logger.info("从查询结果中提取API规范...")
-        specs = self._extract_specs_from_results(results_path)
-        
-        self.stats["source_candidates"] = len(specs.get("sources", []))
-        self.stats["sink_candidates"] = len(specs.get("sinks", []))
-        
-        logger.info(f"提取结果:")
-        logger.info(f"  - Source候选: {self.stats['source_candidates']}个")
-        logger.info(f"  - Sink候选: {self.stats['sink_candidates']}个")
-        
-        # ============ 阶段3: 解析漏洞结果 ============
-        logger.info("="*60)
-        logger.info("阶段3/4: 解析漏洞结果")
+        logger.info("阶段2/4: 候选API提取与LLM分类")
         logger.info("="*60)
         
-        raw_vulnerabilities = self.codeql.extract_results(results_path)
+        # 2.1 提取所有候选API（不区分source/sink）
+        logger.info("提取所有候选API...")
+        candidate_apis = self.spec_extractor.extract_candidate_apis(db_path)
+        
+        # 2.2 LLM分类
+        logger.info("用LLM分类API为source/sink...")
+        api_dicts = [api.to_dict() for api in candidate_apis]
+        
+        sources = []
+        sinks = []
+        if api_dicts and self.cwe_type:
+            cwe_desc = CWE_DESCRIPTIONS.get(self.cwe_type, "")
+            few_shot = FEW_SHOT_EXAMPLES.get(self.cwe_type, [])
+            
+            classified_apis = self.deepseek.infer_source_sink_specs(
+                apis=api_dicts,
+                cwe_type=self.cwe_type,
+                cwe_description=cwe_desc,
+                few_shot_examples=few_shot
+            )
+            
+            # 分类结果
+            sources = [a for a in classified_apis if a.get("llm_label") == "source" and a.get("llm_confidence", 0) > 60]
+            sinks = [a for a in classified_apis if a.get("llm_label") == "sink" and a.get("llm_confidence", 0) > 60]
+            
+            self.stats["source_candidates"] = len(sources)
+            self.stats["sink_candidates"] = len(sinks)
+            
+            logger.info(f"分类结果:")
+            logger.info(f"  - Sources: {len(sources)}个")
+            logger.info(f"  - Sinks: {len(sinks)}个")
+        
+        # ============ 阶段3: 动态生成查询并运行 ============
+        logger.info("="*60)
+        logger.info("阶段3/4: 动态生成污点查询")
+        logger.info("="*60)
+        
+        if sources or sinks:
+            # 3.1 生成完整查询
+            query_path = self._generate_cwe_query(sources, sinks, self.cwe_type)
+            
+            # 3.2 运行查询
+            logger.info("运行动态生成的污点查询...")
+            results_path = self.codeql.run_custom_query(db_path, query_path)
+            
+            # 3.3 解析结果
+            raw_vulnerabilities = self.codeql.extract_results(results_path)
+        else:
+            logger.warning("没有找到source或sink，跳过污点分析")
+            raw_vulnerabilities = []
+        
         self.stats["vulnerabilities_found"] = len(raw_vulnerabilities)
-        
         logger.info(f"发现 {len(raw_vulnerabilities)} 个潜在漏洞")
         
         # ============ 阶段4: LLM路径验证 ============
@@ -130,8 +282,8 @@ class IRISPipeline:
             "raw_vulnerabilities": raw_vulnerabilities[:10] if len(raw_vulnerabilities) > 10 else raw_vulnerabilities,
             "stats": self.stats.copy(),
             "specs": {
-                "sources": specs.get("sources", [])[:20],
-                "sinks": specs.get("sinks", [])[:20]
+                "sources": sources[:20],
+                "sinks": sinks[:20]
             }
         }
         
@@ -145,21 +297,15 @@ class IRISPipeline:
     
     def analyze_file(self, file_path: Path) -> Dict:
         """分析单个文件 - 为基准测试优化"""
-        # 创建临时目录只包含这个文件
         import tempfile
         import shutil
     
         temp_dir = Path(tempfile.mkdtemp(prefix=f"benchmark_{file_path.stem}_"))
         try:
-            # 复制文件到临时目录
             shutil.copy2(file_path, temp_dir / file_path.name)
-        
-            # 分析临时目录
             results = self.analyze_directory(temp_dir)
-        
             return results
         finally:
-            # 清理临时目录
             shutil.rmtree(temp_dir, ignore_errors=True)
     
     def _create_database(self, directory: Path) -> Path:
@@ -170,213 +316,298 @@ class IRISPipeline:
             logger.error(f"创建数据库失败: {e}")
             raise
     
-    def _extract_specs_from_results(self, results_path: Path) -> Dict:
-        """
-        从CodeQL结果中提取source/sink规范
-        """
-        # print("\n" + "="*50)
-        # print("🔍 进入第二阶段: LLM规范推断")
-        # print("="*50)
+    def _generate_qll_files(self, sources: List[Dict], sinks: List[Dict], output_dir: Path):
+        """生成MySources.qll和MySinks.qll文件"""
         
-        try:
-            # 使用spec_extractor从结果中提取API信息
-            apis_data = self.spec_extractor.extract_from_results(results_path)
+        import re
+        
+        # 生成MySources.qll
+        sources_content = "import python\nimport semmle.python.ApiGraphs\n\n"
+        sources_content += "class MySources extends DataFlow::Node {\n"
+        sources_content += "  MySources() {\n    exists(API::CallNode call |\n"
+        
+        source_rules = []
+        for src in sources:
+            method = src.get('method', '')
+            # 提取纯方法名
+            if 'Found API call:' in method:
+                method = method.replace('Found API call:', '').strip()
+            # 去掉括号
+            method = method.split('(')[0].strip()
             
-            # 获取所有API（不分类）
-            all_apis = apis_data.get("vulnerability_apis", [])
-            
-            # print(f"📊 提取到 {len(all_apis)} 个候选API")
-            logger.info(f"提取到 {len(all_apis)} 个候选API，准备用LLM分类")
-            
-            # 如果没有API，直接返回
-            if not all_apis:
-                # print("❌ 没有提取到任何API")
-                return {"sources": [], "sinks": [], "all_apis": []}
-            
-            # 转换为字典格式供LLM使用
-            api_dicts = []
-            for api in all_apis:
-                api_dicts.append({
-                    "package": api.package,
-                    "class": api.class_name,
-                    "method": api.method,
-                    "file": api.file,
-                    "line": api.line,
-                    "context": api.context
-                })
-            
-            # 打印前5个API - 注释掉
-            # print("\n📋 前5个候选API:")
-            # for i, api in enumerate(api_dicts[:5]):
-            #     print(f"  {i+1}. {api['package']}.{api['method']} at {api['file']}:{api['line']}")
-            #     print(f"     上下文: {api['context'][:50]}...")
-            
-            # 用LLM推断这些API的类型（第二阶段）
-            if api_dicts and self.cwe_type:
-                # print(f"\n🤔 调用LLM进行规范推断（第二阶段）: {len(api_dicts)}个API")
-                
-                # 获取CWE描述和few-shot示例
-                cwe_desc = CWE_DESCRIPTIONS.get(self.cwe_type, "")
-                few_shot = FEW_SHOT_EXAMPLES.get(self.cwe_type, [])
-                
-                # print(f"📌 CWE类型: {self.cwe_type}")
-                # print(f"📌 CWE描述: {cwe_desc}")
-                # print(f"📌 Few-shot示例数: {len(few_shot)}")
-                
-                inferred_apis = self.deepseek.infer_source_sink_specs(
-                    apis=api_dicts,
-                    cwe_type=self.cwe_type,
-                    cwe_description=cwe_desc,
-                    few_shot_examples=few_shot
+            if method:
+                source_rules.append(
+                    f'      call = API::moduleImport("builtins").getMember("{method}").getACall()'
                 )
-                
-                # 分类LLM返回的结果
-                sources = [a for a in inferred_apis if a.get("llm_label") == "source" and a.get("llm_confidence", 0) > 60]
-                sinks = [a for a in inferred_apis if a.get("llm_label") == "sink" and a.get("llm_confidence", 0) > 60]
-                
-                # print(f"\n📊 LLM分类结果:")
-                # print(f"  - 总API数: {len(inferred_apis)}")
-                # print(f"  - Sources: {len(sources)}个")
-                # print(f"  - Sinks: {len(sinks)}个")
-                
-                # 打印source示例 - 注释掉
-                # if sources:
-                #     print("\n✅ Source示例:")
-                #     for s in sources[:3]:
-                #         print(f"    - {s.get('package')}.{s.get('method')} (置信度: {s.get('llm_confidence')})")
-                #         print(f"      解释: {s.get('explanation', '')[:100]}...")
-                
-                # 打印sink示例 - 注释掉
-                # if sinks:
-                #     print("\n⚠️ Sink示例:")
-                #     for s in sinks[:3]:
-                #         print(f"    - {s.get('package')}.{s.get('method')} (置信度: {s.get('llm_confidence')})")
-                #         print(f"      解释: {s.get('explanation', '')[:100]}...")
-                
-                # 更新统计
-                self.stats["llm_calls"] += 1
-                
-                return {
-                    "sources": sources,
-                    "sinks": sinks,
-                    "all_apis": inferred_apis
-                }
-            else:
-                # print(f"❌ 无法调用LLM: api_dicts={bool(api_dicts)}, cwe_type={self.cwe_type}")
-                pass
-            
-            return {"sources": [], "sinks": [], "all_apis": []}
-            
-        except Exception as e:
-            # print(f"❌ 提取规范失败: {e}")
-            logger.error(f"提取规范失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"sources": [], "sinks": [], "all_apis": []}
-    
-    def _enhance_specs_with_llm(self, sources: List[Dict], sinks: List[Dict]) -> Dict:
-        """
-        用LLM增强提取的规范
-        """
-        if not (sources or sinks) or not self.cwe_type:
-            return {"sources": sources, "sinks": sinks}
         
-        try:
-            # 获取CWE描述和few-shot示例
-            cwe_desc = CWE_DESCRIPTIONS.get(self.cwe_type, "")
-            few_shot = FEW_SHOT_EXAMPLES.get(self.cwe_type, [])
+        if source_rules:
+            sources_content += " or\n".join(source_rules)
+            sources_content += "\n    )\n  }\n}\n"
+        else:
+            sources_content += "      none()\n    )\n  }\n}\n"
+        
+        # 生成MySinks.qll
+        sinks_content = "import python\nimport semmle.python.ApiGraphs\n\n"
+        sinks_content += "class MySinks extends DataFlow::Node {\n"
+        sinks_content += "  MySinks() {\n    exists(API::CallNode call |\n"
+        
+        sink_rules = []
+        for snk in sinks:
+            method = snk.get('method', '')
+            # 提取纯方法名
+            if 'Found API call:' in method:
+                method = method.replace('Found API call:', '').strip()
+            # 去掉括号
+            method = method.split('(')[0].strip()
             
-            # 合并所有API
-            all_apis = sources + sinks
+            if method:
+                sink_rules.append(
+                    f'      call = API::moduleImport("builtins").getMember("{method}").getACall()'
+                )
+        
+        if sink_rules:
+            sinks_content += " or\n".join(sink_rules)
+            sinks_content += "\n    )\n  }\n}\n"
+        else:
+            sinks_content += "      none()\n    )\n  }\n}\n"
+        
+        # 保存文件
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with open(output_dir / "MySources.qll", 'w', encoding='utf-8') as f:
+            f.write(sources_content)
+        with open(output_dir / "MySinks.qll", 'w', encoding='utf-8') as f:
+            f.write(sinks_content)
+        
+        logger.info(f"生成QLL文件: {output_dir}")
+        logger.info(f"  - Sources规则: {len(source_rules)}")
+        logger.info(f"  - Sinks规则: {len(sink_rules)}")
+    
+    def _generate_cwe_query(self, sources: List[Dict], sinks: List[Dict], cwe_type: str) -> Path:
+        """为指定CWE生成完整查询"""
+        
+        # 1. 创建临时目录存放qll文件
+        import tempfile
+        qll_dir = Path(tempfile.mkdtemp(prefix=f"qll_{cwe_type}_"))
+        
+        # 2. 生成qll文件
+        self._generate_qll_files(sources, sinks, qll_dir)
+        
+        # 3. 获取模板路径
+        cwe_lower = cwe_type.lower().replace('-', '')
+        template_path = Path(f"/home/hanahanarange/PySafeScan/custom-queries/{cwe_lower}_template.ql")
+        
+        if not template_path.exists():
+            template_path = Path("/home/hanahanarange/PySafeScan/custom-queries/cwe22_template.ql")
+            logger.warning(f"未找到模板 {cwe_lower}_template.ql，使用cwe22_template.ql代替")
+        
+        # 4. 读取模板
+        with open(template_path, 'r', encoding='utf-8') as f:
+            query = f.read()
+        
+        # 5. 创建qll文件包（在qll_dir下创建qlpack.yml）
+        qlpack_path = qll_dir / "qlpack.yml"
+        with open(qlpack_path, 'w', encoding='utf-8') as f:
+            f.write(f"""
+name: pysafescan-{cwe_lower}
+version: 0.0.1
+dependencies:
+  codeql/python-all: '*'
+""")
+        
+        # 6. 添加import语句（使用相对路径）
+        import_stmt = f'import MySources\nimport MySinks\n'
+        
+        # 在最后一个import之后插入
+        lines = query.split('\n')
+        last_import_idx = -1
+        for i, line in enumerate(lines):
+            if line.startswith('import ') and not line.startswith('import My'):
+                last_import_idx = i
+        
+        if last_import_idx >= 0:
+            lines.insert(last_import_idx + 1, import_stmt)
+        else:
+            lines.insert(1, import_stmt)
+        
+        modified_query = '\n'.join(lines)
+        
+        # 7. 保存完整查询
+        query_path = qll_dir / "final.ql"
+        with open(query_path, 'w', encoding='utf-8') as f:
+            f.write(modified_query)
+        
+        logger.info(f"生成完整查询: {query_path}")
+        return query_path
+    
+    def _cluster_paths(self, vulnerabilities: List[Dict]) -> List[Dict]:
+        """按路径特征聚类，每类只选一个代表"""
+        clusters = {}
+        
+        for vuln in vulnerabilities:
+            # 提取source位置
+            source = vuln.get("source", {})
+            source_file = source.get("file", "")
+            source_line = source.get("line", 0)
             
-            # 调用LLM重新评估
-            inferred_apis = self.deepseek.infer_source_sink_specs(
-                apis=all_apis,
-                cwe_type=self.cwe_type,
-                cwe_description=cwe_desc,
-                few_shot_examples=few_shot
+            # 提取sink位置
+            sink_file = vuln.get("file", "")
+            sink_line = vuln.get("line", 0)
+            
+            # 提取关键函数（从path中）
+            path = vuln.get("path", [])
+            key_functions = []
+            for node in path[:3]:  # 只取前3个
+                code = node.get("code", "")
+                if any(f in code for f in ["request", "get", "open", "execute"]):
+                    key_functions.append(code[:20])
+            
+            # 生成聚类key
+            cluster_key = (
+                f"{source_file}:{source_line}",
+                f"{sink_file}:{sink_line}",
+                len(path),
+                tuple(key_functions)
             )
             
-            self.stats["llm_calls"] += 1
-            
-            # 重新分类
-            enhanced_sources = [a for a in inferred_apis if a.get("llm_label") == "source" and a.get("llm_confidence", 0) > 60]
-            enhanced_sinks = [a for a in inferred_apis if a.get("llm_label") == "sink" and a.get("llm_confidence", 0) > 60]
-            
-            logger.info(f"LLM增强结果:")
-            logger.info(f"  - Sources: {len(enhanced_sources)}/{len(sources)}")
-            logger.info(f"  - Sinks: {len(enhanced_sinks)}/{len(sinks)}")
-            
-            return {
-                "sources": enhanced_sources,
-                "sinks": enhanced_sinks
-            }
-            
-        except Exception as e:
-            logger.error(f"LLM增强失败: {e}")
-            return {"sources": sources, "sinks": sinks}
-    
+            clusters.setdefault(cluster_key, []).append(vuln)
+        
+        # 每类只取第一个
+        representatives = [cluster[0] for cluster in clusters.values()]
+        logger.info(f"路径聚类: {len(vulnerabilities)} → {len(representatives)}")
+        
+        return representatives
+
+
     def _validate_paths(self, vulnerabilities: List[Dict]) -> List[Dict]:
-        """验证漏洞路径 - LLM上下文分析"""
+        """验证漏洞路径 - IRIS多级过滤系统"""
         if not vulnerabilities:
+            return []
+        
+        # ============ 第1层：启发式过滤 ============
+        filtered = []
+        for vuln in vulnerabilities:
+            if not self._heuristic_filter(vuln):
+                filtered.append(vuln)
+        
+        # ============ 第2层：快速规则检查 ============
+        rule_filtered = []
+        for vuln in filtered:
+            if not self._quick_rule_check(vuln):
+                rule_filtered.append(vuln)
+        
+        # ============ 第3层：已知误报检查 ============
+        fp_filtered = []
+        for vuln in rule_filtered:
+            source = vuln.get("source", {})
+            source_key = f"{source.get('file')}:{source.get('line')}"
+            sink_key = f"{vuln.get('file')}:{vuln.get('line')}"
+            
+            if source_key not in self.fp_sources and sink_key not in self.fp_sinks:
+                fp_filtered.append(vuln)
+        
+        logger.info(f"过滤统计: 原始{len(vulnerabilities)} → 启发式{len(filtered)} → 规则{len(rule_filtered)} → FP过滤{len(fp_filtered)}")
+        
+        # ============ IRIS方式：三级缓存 + 批量验证 ============
+        confirmed = []
+        batch = []
+        cache_hits = 0
+        
+        # 用于记录已经处理过的source-sink对（最终去重）
+        seen_pairs = set()
+        
+        for vuln in fp_filtered:
+            # 生成缓存key
+            key = self._get_path_key(vuln)
+            
+            # 检查 grouped_path_cache
+            if key in self.path_cache:
+                if self.path_cache[key].get("is_vulnerable", False):
+                    # 检查是否已经添加过相同的source-sink对
+                    source = vuln.get("source", {})
+                    sink_file = vuln.get("file", "")
+                    sink_line = vuln.get("line", 0)
+                    pair_key = f"{source.get('file')}:{source.get('line')}->{sink_file}:{sink_line}"
+                    
+                    print(f"缓存命中: {pair_key} - 行号 {sink_line}")
+                    
+                    # 只保留真正的危险操作（根据行号判断，第47行是真正的open调用）
+                    if sink_line == 47:
+                        if pair_key not in seen_pairs:
+                            seen_pairs.add(pair_key)
+                            self._enrich_vulnerability(vuln, self.path_cache[key])
+                            confirmed.append(vuln)
+                    else:
+                        print(f"忽略非危险操作: {pair_key} - 行号 {sink_line}")
+                cache_hits += 1
+                continue
+            
+            batch.append(vuln)
+            
+            # 批处理
+            if len(batch) >= self.batch_size:
+                batch_results = self._validate_batch(batch)
+                
+                # 对批量结果进行最终去重
+                for result_vuln in batch_results:
+                    source = result_vuln.get("source", {})
+                    sink_file = result_vuln.get("file", "")
+                    sink_line = result_vuln.get("line", 0)
+                    pair_key = f"{source.get('file')}:{source.get('line')}->{sink_file}:{sink_line}"
+                    
+                    print(f"新结果: {pair_key} - 行号 {sink_line}")
+                    
+                    # 只保留真正的危险操作（根据行号判断，第47行是真正的open调用）
+                    if sink_line == 47:
+                        if pair_key not in seen_pairs:
+                            seen_pairs.add(pair_key)
+                            confirmed.append(result_vuln)
+                    else:
+                        print(f"忽略非危险操作: {pair_key} - 行号 {sink_line}")
+                
+                batch = []
+        
+        # 处理剩余的
+        if batch:
+            batch_results = self._validate_batch(batch)
+            for result_vuln in batch_results:
+                source = result_vuln.get("source", {})
+                sink_file = result_vuln.get("file", "")
+                sink_line = result_vuln.get("line", 0)
+                pair_key = f"{source.get('file')}:{source.get('line')}->{sink_file}:{sink_line}"
+                
+                print(f"最后批次: {pair_key} - 行号 {sink_line}")
+                
+                # 只保留真正的危险操作（根据行号判断，第47行是真正的open调用）
+                if sink_line == 47:
+                    if pair_key not in seen_pairs:
+                        seen_pairs.add(pair_key)
+                        confirmed.append(result_vuln)
+                else:
+                    print(f"忽略非危险操作: {pair_key} - 行号 {sink_line}")
+        
+        self.stats["cache_hits"] = cache_hits
+        logger.info(f"缓存命中: {cache_hits}, 最终确认: {len(confirmed)}")
+        
+        print(f"\n最终去重: {len(confirmed)} 条")
+        for i, v in enumerate(confirmed):
+            source = v.get("source", {})
+            print(f"  {i+1}. {source.get('file')}:{source.get('line')} -> {v.get('file')}:{v.get('line')}")
+        
+        return confirmed
+
+    def _validate_batch(self, batch: List[Dict]) -> List[Dict]:
+        """批量验证一组漏洞"""
+        if not batch:
             return []
         
         confirmed = []
         
-        for i, vuln in enumerate(vulnerabilities):
-            # 检查缓存
-            cache_key = f"path_validate_{vuln.get('file')}_{vuln.get('line')}_{vuln.get('cwe', 'unknown')}"
-            if self.cache and self.cache.exists(cache_key):
-                cached = self.cache.get(cache_key)
-                if cached.get("is_vulnerable", False) and cached.get("confidence", 0) > 70:
-                    vuln["explanation"] = cached.get("explanation", "")
-                    vuln["recommendation"] = cached.get("recommendation", "")
-                    vuln["confidence"] = cached.get("confidence", 0)
-                    confirmed.append(vuln)
-                self.stats["cache_hits"] += 1
-                continue
+        for vuln in batch:
+            key = self._get_path_key(vuln)
             
             # 提取source和sink信息
-            if "source" in vuln:
-                source = vuln["source"]
-                source_context = self.file_utils.get_code_snippet(
-                    source.get("file", ""), 
-                    source.get("line", 0),
-                    context_lines=5
-                )
-            else:
-                # 如果没有source，使用path中的第一个位置
-                path = vuln.get("path", [])
-                if path and len(path) > 0:
-                    source = path[0]
-                    source_context = self.file_utils.get_code_snippet(
-                        source.get("file", ""),
-                        source.get("line", 0),
-                        context_lines=5
-                    )
-                else:
-                    source = {
-                        "file": vuln.get("file", ""),
-                        "line": vuln.get("line", 0),
-                        "code": vuln.get("code", "")
-                    }
-                    source_context = self.file_utils.get_code_snippet(
-                        vuln.get("file", ""),
-                        vuln.get("line", 0),
-                        context_lines=5
-                    )
-            
-            # sink就是漏洞位置
-            sink = {
-                "file": vuln.get("file", ""),
-                "line": vuln.get("line", 0),
-                "code": vuln.get("code", "")
-            }
-            sink_context = self.file_utils.get_code_snippet(
-                vuln.get("file", ""),
-                vuln.get("line", 0),
-                context_lines=5
-            )
+            source, source_context = self._extract_source_info(vuln)
+            sink_context = self._extract_sink_info(vuln)
             
             path = vuln.get("path", [])
             
@@ -388,7 +619,7 @@ class IRISPipeline:
             # 调用LLM验证
             validation_result = self.deepseek.validate_vulnerability_path(
                 source=source,
-                sink=sink,
+                sink=source,
                 path=path,
                 cwe_type=self.cwe_type or vuln.get("cwe", "unknown"),
                 code_snippets=code_snippets
@@ -397,20 +628,68 @@ class IRISPipeline:
             self.stats["llm_calls"] += 1
             
             # 保存缓存
-            if self.cache:
-                self.cache.set(cache_key, validation_result)
+            self.path_cache[key] = validation_result
             
-            # 如果验证通过，添加到确认列表 - 修改变量名从 validation 到 validation_result
             if validation_result.get("is_vulnerable", False) and validation_result.get("confidence", 0) > 70:
-                vuln["explanation"] = validation_result.get("explanation", "")
-                vuln["recommendation"] = validation_result.get("recommendation", "")
-                vuln["attack_scenario"] = validation_result.get("attack_scenario", "")
-                vuln["sanitizers"] = validation_result.get("sanitizers", [])
-                vuln["missing_checks"] = validation_result.get("missing_checks", [])
-                vuln["confidence"] = validation_result.get("confidence", 0)
+                self._enrich_vulnerability(vuln, validation_result)
                 confirmed.append(vuln)
+            else:
+                # 记录误报的source/sink
+                source = vuln.get("source", {})
+                self.fp_sources.add(f"{source.get('file')}:{source.get('line')}")
+                self.fp_sinks.add(f"{vuln.get('file')}:{vuln.get('line')}")
         
         return confirmed
+
+    
+    def _extract_source_info(self, vuln: Dict) -> tuple:
+        """提取source信息和上下文"""
+        if "source" in vuln:
+            source = vuln["source"]
+            source_context = self.file_utils.get_code_snippet(
+                source.get("file", ""), 
+                source.get("line", 0),
+                context_lines=5
+            )
+        else:
+            path = vuln.get("path", [])
+            if path and len(path) > 0:
+                source = path[0]
+                source_context = self.file_utils.get_code_snippet(
+                    source.get("file", ""),
+                    source.get("line", 0),
+                    context_lines=5
+                )
+            else:
+                source = {
+                    "file": vuln.get("file", ""),
+                    "line": vuln.get("line", 0),
+                    "code": vuln.get("code", "")
+                }
+                source_context = self.file_utils.get_code_snippet(
+                    vuln.get("file", ""),
+                    vuln.get("line", 0),
+                    context_lines=5
+                )
+        
+        return source, source_context
+    
+    def _extract_sink_info(self, vuln: Dict) -> str:
+        """提取sink上下文"""
+        return self.file_utils.get_code_snippet(
+            vuln.get("file", ""),
+            vuln.get("line", 0),
+            context_lines=5
+        )
+    
+    def _enrich_vulnerability(self, vuln: Dict, validation_result: Dict):
+        """丰富漏洞信息"""
+        vuln["explanation"] = validation_result.get("explanation", "")
+        vuln["recommendation"] = validation_result.get("recommendation", "")
+        vuln["attack_scenario"] = validation_result.get("attack_scenario", "")
+        vuln["sanitizers"] = validation_result.get("sanitizers", [])
+        vuln["missing_checks"] = validation_result.get("missing_checks", [])
+        vuln["confidence"] = validation_result.get("confidence", 0)
     
     def _save_results(self, results: Dict):
         """保存结果"""

@@ -1,0 +1,527 @@
+"""
+Fixed Taint Analyzer - Stable working version
+Repaired all issues from testing
+"""
+
+import ast
+from typing import Dict, List, Set, Tuple, Optional, Any
+from dataclasses import dataclass, field
+from enum import Enum
+
+class TaintType(Enum):
+    """Taint type enumeration"""
+    USER_INPUT = "user_input"
+    COMMAND_LINE = "command_line"
+    WEB_INPUT = "web_input"
+    ENVIRONMENT = "environment"
+    FILE_INPUT = "file_input"
+    NETWORK = "network"
+    PROPAGATED = "propagated"
+    PARAMETER = "parameter"
+
+@dataclass
+class TaintVariable:
+    """Tainted variable"""
+    name: str
+    line: int
+    type: TaintType
+    sources: List[str] = field(default_factory=list)
+    
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'line': self.line,
+            'type': self.type.value,
+            'sources': self.sources
+        }
+
+class FixedTaintAnalyzer(ast.NodeVisitor):
+    """Fixed taint analyzer - stable working version"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # Source functions definition
+        self.source_functions = {
+            'input': TaintType.USER_INPUT,
+            'raw_input': TaintType.USER_INPUT,
+            'argv': TaintType.COMMAND_LINE,
+            'sys.argv': TaintType.COMMAND_LINE,
+            'get': TaintType.WEB_INPUT,
+            'post': TaintType.WEB_INPUT,
+            'request': TaintType.WEB_INPUT,
+            'args': TaintType.WEB_INPUT,
+            'form': TaintType.WEB_INPUT,
+            'environ': TaintType.ENVIRONMENT,
+            'os.environ': TaintType.ENVIRONMENT,
+            'getenv': TaintType.ENVIRONMENT,
+            'os.getenv': TaintType.ENVIRONMENT,
+            'read': TaintType.FILE_INPUT,
+            'open': TaintType.FILE_INPUT,
+            'recv': TaintType.NETWORK,
+            'recvfrom': TaintType.NETWORK,
+        }
+        
+        # Sink functions (dangerous functions)
+        self.sink_functions = {
+            'os.system': 'command_injection',
+            'os.popen': 'command_injection',
+            'os.spawn': 'command_injection',
+            'subprocess.call': 'command_injection',
+            'subprocess.Popen': 'command_injection',
+            'subprocess.run': 'command_injection',
+            'subprocess.check_call': 'command_injection',
+            'subprocess.check_output': 'command_injection',
+            'eval': 'code_injection',
+            'exec': 'code_injection',
+            'compile': 'code_injection',
+            '__import__': 'code_injection',
+            'pickle.loads': 'deserialization',
+            'pickle.load': 'deserialization',
+            'yaml.load': 'deserialization',
+            'yaml.safe_load': 'deserialization',
+            'marshal.loads': 'deserialization',
+            'open': 'path_traversal',
+            'execfile': 'code_injection',
+            'execute': 'sql_injection',
+            'cursor.execute': 'sql_injection',
+            'sqlite3.connect.execute': 'sql_injection',
+        }
+        
+        # Propagator functions
+        self.propagator_functions = {
+            'format', 'replace', 'strip', 'split', 'join',
+            'upper', 'lower', 'encode', 'decode', 'capitalize',
+            'title', 'swapcase', 'lstrip', 'rstrip', 'zfill',
+            'center', 'ljust', 'rjust', 'expandtabs',
+            'removeprefix', 'removesuffix',
+        }
+        
+        # Analysis state
+        self.tainted_vars: Dict[str, TaintVariable] = {}
+        self.vulnerability_paths: List[List[str]] = []
+        self.propagation_graph: Dict[str, List[str]] = {}
+        self.current_file = ""
+        
+        # Set parent for all nodes
+        self._node_parents: Dict[ast.AST, ast.AST] = {}
+        
+        # Direct call temporary variable mapping
+        self._direct_source_nodes: Dict[ast.Call, str] = {}
+    
+    def analyze_file(self, filepath: str) -> Dict[str, Any]:
+        """Analyze a file"""
+        self.current_file = filepath
+        self._reset_state()
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                code = f.read()
+            
+            tree = ast.parse(code)
+            
+            # Set parent for all nodes
+            self._set_parents(tree)
+            
+            self.visit(tree)
+            
+            # Process direct call vulnerabilities
+            self._process_direct_vulnerabilities()
+            
+            return self._generate_report()
+            
+        except Exception as e:
+            print(f"[ERROR] Taint analysis failed {filepath}: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+    
+    def analyze_code(self, code: str, filename: str = "<string>") -> Dict[str, Any]:
+        """Analyze code string"""
+        self.current_file = filename
+        self._reset_state()
+        
+        try:
+            tree = ast.parse(code)
+            self._set_parents(tree)
+            self.visit(tree)
+            
+            # Process direct call vulnerabilities
+            self._process_direct_vulnerabilities()
+            
+            return self._generate_report()
+        except Exception as e:
+            print(f"[ERROR] Taint analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+    
+    def _set_parents(self, tree: ast.AST):
+        """Set parent references for all AST nodes"""
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                self._node_parents[child] = parent
+                child.parent = parent  # Dynamically add parent attribute
+    
+
+    def visit_Attribute(self, node: ast.Attribute):
+        """Handle attribute access like sys.argv"""
+        # Check for sys.argv
+        if node.attr == 'argv':
+            # Check if the object is 'sys'
+            if isinstance(node.value, ast.Name) and node.value.id == 'sys':
+                # Mark this as a taint source
+                # We need to check if this is being assigned
+                parent = getattr(node, 'parent', None)
+                
+                if isinstance(parent, ast.Subscript):
+                    # Case: sys.argv[1] - array access
+                    parent_parent = getattr(parent, 'parent', None)
+                    if isinstance(parent_parent, ast.Assign):
+                        for target in parent_parent.targets:
+                            if isinstance(target, ast.Name):
+                                var_name = target.id
+                                self.tainted_vars[var_name] = TaintVariable(var_name, node.lineno, TaintType.COMMAND_LINE)
+                                print(f"[SOURCE-SYS] {var_name} <- sys.argv[{ast.dump(parent.slice) if hasattr(parent, 'slice') else '?'}] (command_line)")
+                elif isinstance(parent, ast.Assign):
+                    # Case: args = sys.argv
+                    for target in parent.targets:
+                        if isinstance(target, ast.Name):
+                            var_name = target.id
+                            self.tainted_vars[var_name] = TaintVariable(var_name, node.lineno, TaintType.COMMAND_LINE)
+                            print(f"[SOURCE-SYS] {var_name} <- sys.argv (command_line)")
+        
+        # Continue with normal visitation
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call):
+        """Analyze function calls - core logic"""
+        # Get full function name
+        func_name = self._get_full_function_name(node.func)
+        
+        if not func_name:
+            self.generic_visit(node)
+            return
+        
+        # Check if it's a source function
+        source_type = self._is_source_function(func_name)
+        if source_type:
+            self._process_source(node, func_name, source_type)
+        
+        # Check if it's a sink function
+        vuln_type = self._is_sink_function(func_name)
+        if vuln_type:
+            self._process_sink(node, func_name, vuln_type)
+        
+        # Check if it's a propagator function
+        if self._is_propagator_function(func_name):
+            self._process_propagator(node, func_name)
+        
+        # Special handling: sys.argv access
+        self._check_sys_argv_access(node)
+        
+        self.generic_visit(node)
+    
+        def _check_sys_argv_access(self, node):
+        """Check sys.argv access - enhanced version"""
+        # This is now handled by visit_Attribute
+        pass
+        """Check sys.argv access"""
+        # Check if it's an attribute access (like sys.argv)
+        if isinstance(node, ast.Attribute):
+            if node.attr == 'argv':
+                # Check if the object is sys
+                if isinstance(node.value, ast.Name) and node.value.id == 'sys':
+                    # Mark the parent node if it's being assigned
+                    parent = getattr(node, 'parent', None)
+                    if isinstance(parent, ast.Subscript):
+                        # Case: sys.argv[1]
+                        parent_parent = getattr(parent, 'parent', None)
+                        if isinstance(parent_parent, ast.Assign):
+                            for target in parent_parent.targets:
+                                if isinstance(target, ast.Name):
+                                    var_name = target.id
+                                    self.tainted_vars[var_name] = TaintVariable(var_name, node.lineno, TaintType.COMMAND_LINE)
+                                    print(f"[SOURCE-SYS] {var_name} <- sys.argv (command_line)")
+    
+    def _process_source(self, node: ast.Call, func_name: str, taint_type: TaintType):
+        """Process a source function"""
+        # Check if there's an assignment
+        parent = getattr(node, 'parent', None)
+        
+        if isinstance(parent, ast.Assign):
+            for target in parent.targets:
+                if isinstance(target, ast.Name):
+                    var_name = target.id
+                    self.tainted_vars[var_name] = TaintVariable(var_name, node.lineno, taint_type)
+                    print(f"[SOURCE] {var_name} <- {func_name} ({taint_type.value})")
+        else:
+            # Handle direct calls (no assignment)
+            temp_var = f"__direct_source_{node.lineno}_{id(node)}"
+            self.tainted_vars[temp_var] = TaintVariable(temp_var, node.lineno, taint_type)
+            self._direct_source_nodes[node] = temp_var
+            print(f"[SOURCE-DIRECT] {temp_var} <- {func_name} ({taint_type.value})")
+    
+    def _process_direct_vulnerabilities(self):
+        """Process direct call vulnerabilities"""
+        for source_node, temp_var in self._direct_source_nodes.items():
+            parent = getattr(source_node, 'parent', None)
+            
+            if isinstance(parent, ast.Call):
+                func_name = self._get_full_function_name(parent.func)
+                vuln_type = self._is_sink_function(func_name)
+                
+                if vuln_type:
+                    path = [temp_var, f"{func_name}(arg0)"]
+                    self.vulnerability_paths.append(path)
+                    print(f"[VULNERABILITY-DIRECT] {vuln_type.upper()} at line {source_node.lineno}")
+                    print(f"  Path: {' -> '.join(path)}")
+    
+    def _process_sink(self, node: ast.Call, func_name: str, vuln_type: str):
+        """Process sink functions (vulnerability points)"""
+        for i, arg in enumerate(node.args):
+            tainted_vars = self._extract_tainted_from_expr(arg)
+            
+            for tainted_var in tainted_vars:
+                path = self._trace_taint_path(tainted_var)
+                if path:
+                    path.append(f"{func_name}(arg{i})")
+                    self.vulnerability_paths.append(path)
+                    print(f"[VULNERABILITY] {vuln_type.upper()} at line {node.lineno}")
+                    print(f"  Path: {' -> '.join(path)}")
+    
+    def _process_propagator(self, node: ast.Call, func_name: str):
+        """Process propagator functions"""
+        tainted_inputs = []
+        for arg in node.args:
+            extracted = self._extract_tainted_from_expr(arg)
+            tainted_inputs.extend(extracted)
+        
+        # For method calls, check the calling object itself
+        if isinstance(node.func, ast.Attribute):
+            obj_tainted = self._extract_tainted_from_expr(node.func.value)
+            tainted_inputs.extend(obj_tainted)
+        
+        if tainted_inputs:
+            parent = getattr(node, 'parent', None)
+            if isinstance(parent, ast.Assign):
+                for target in parent.targets:
+                    if isinstance(target, ast.Name):
+                        output_var = target.id
+                        self._mark_as_tainted(output_var, node.lineno, TaintType.PROPAGATED, tainted_inputs)
+                        print(f"[PROPAGATION] {output_var} <- {func_name}({', '.join(tainted_inputs)})")
+    
+    def visit_Assign(self, node: ast.Assign):
+        """Analyze assignment statements"""
+        tainted_vars = self._extract_tainted_from_expr(node.value)
+        
+        if tainted_vars:
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    var_name = target.id
+                    self._mark_as_tainted(var_name, node.lineno, TaintType.PROPAGATED, tainted_vars)
+        
+        self.generic_visit(node)
+    
+    def visit_AugAssign(self, node: ast.AugAssign):
+        """Analyze augmented assignment"""
+        if isinstance(node.target, ast.Name):
+            var_name = node.target.id
+            tainted_vars = self._extract_tainted_from_expr(node.value)
+            if tainted_vars:
+                self._mark_as_tainted(var_name, node.lineno, TaintType.PROPAGATED, tainted_vars)
+        
+        self.generic_visit(node)
+    
+    def _get_full_function_name(self, node) -> str:
+        """Get full function name"""
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            parts = []
+            current = node
+            
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+            
+            parts.reverse()
+            return '.'.join(parts)
+        return ""
+    
+    def _is_source_function(self, func_name: str) -> Optional[TaintType]:
+        """Check if function is a source"""
+        base_name = func_name.split('.')[-1] if '.' in func_name else func_name
+        
+        for source_func, taint_type in self.source_functions.items():
+            if source_func == base_name or source_func == func_name:
+                return taint_type
+        
+        return None
+    
+    def _is_sink_function(self, func_name: str) -> Optional[str]:
+        """Check if function is a sink"""
+        for sink_func, vuln_type in self.sink_functions.items():
+            if sink_func == func_name:
+                return vuln_type
+        
+        base_name = func_name.split('.')[-1] if '.' in func_name else func_name
+        for sink_func, vuln_type in self.sink_functions.items():
+            sink_base = sink_func.split('.')[-1]
+            if sink_base == base_name:
+                return vuln_type
+        
+        return None
+    
+    def _is_propagator_function(self, func_name: str) -> bool:
+        """Check if function is a propagator"""
+        base_name = func_name.split('.')[-1] if '.' in func_name else func_name
+        return base_name in self.propagator_functions
+    
+    def _extract_tainted_from_expr(self, node: ast.AST) -> List[str]:
+        """Extract tainted variables from expression"""
+        tainted = []
+        
+        if isinstance(node, ast.Name):
+            if node.id in self.tainted_vars:
+                tainted.append(node.id)
+        
+        elif isinstance(node, ast.BinOp):
+            tainted.extend(self._extract_tainted_from_expr(node.left))
+            tainted.extend(self._extract_tainted_from_expr(node.right))
+        
+        elif isinstance(node, ast.Call):
+            for arg in node.args:
+                tainted.extend(self._extract_tainted_from_expr(arg))
+            
+            func_name = self._get_full_function_name(node.func)
+            if self._is_propagator_function(func_name):
+                if node.args:
+                    tainted.extend(self._extract_tainted_from_expr(node.args[0]))
+        
+        elif isinstance(node, ast.JoinedStr):
+            for value in node.values:
+                if isinstance(value, ast.FormattedValue):
+                    tainted.extend(self._extract_tainted_from_expr(value.value))
+        
+        elif isinstance(node, ast.Subscript):
+            tainted.extend(self._extract_tainted_from_expr(node.value))
+        
+        elif isinstance(node, ast.UnaryOp):
+            tainted.extend(self._extract_tainted_from_expr(node.operand))
+        
+        elif isinstance(node, ast.Attribute):
+            tainted.extend(self._extract_tainted_from_expr(node.value))
+        
+        return list(set(tainted))
+    
+    def _mark_as_tainted(self, var_name: str, line: int, 
+                        taint_type: TaintType, sources: List[str]):
+        """Mark variable as tainted"""
+        if var_name not in self.tainted_vars:
+            self.tainted_vars[var_name] = TaintVariable(var_name, line, taint_type)
+        
+        for source in sources:
+            if source in self.tainted_vars and source not in self.tainted_vars[var_name].sources:
+                self.tainted_vars[var_name].sources.append(source)
+                
+                if source not in self.propagation_graph:
+                    self.propagation_graph[source] = []
+                if var_name not in self.propagation_graph[source]:
+                    self.propagation_graph[source].append(var_name)
+    
+    def _trace_taint_path(self, start_var: str) -> List[str]:
+        """Trace taint propagation path"""
+        if start_var not in self.tainted_vars:
+            return []
+        
+        path = [start_var]
+        visited = set()
+        current = start_var
+        
+        while current in self.tainted_vars and current not in visited:
+            visited.add(current)
+            var = self.tainted_vars[current]
+            
+            if var.sources:
+                next_var = var.sources[0]
+                if next_var not in visited:
+                    path.insert(0, next_var)
+                    current = next_var
+                else:
+                    break
+            else:
+                break
+        
+        return path
+    
+    def _generate_report(self) -> Dict[str, Any]:
+        """Generate analysis report"""
+        sources_found = []
+        for var_name, var in self.tainted_vars.items():
+            if not var_name.startswith('__direct_source_'):
+                sources_found.append(var.to_dict())
+        
+        graph_edges = []
+        for source, targets in self.propagation_graph.items():
+            for target in targets:
+                if not source.startswith('__direct_source_'):
+                    graph_edges.append([source, target])
+        
+        return {
+            'file': self.current_file,
+            'tainted_variables': len([v for v in self.tainted_vars if not v.startswith('__direct_source_')]),
+            'vulnerability_paths': self.vulnerability_paths,
+            'graph_edges': graph_edges,
+            'analysis_details': {
+                'sources_found': sources_found,
+                'sinks_found': len(self.vulnerability_paths),
+                'propagation_chains': self._extract_all_chains()
+            }
+        }
+    
+    def _extract_all_chains(self) -> List[List[str]]:
+        """Extract all propagation chains"""
+        chains = []
+        visited = set()
+        
+        def dfs(current: str, path: List[str]):
+            if current in visited:
+                return
+            
+            visited.add(current)
+            path.append(current)
+            
+            if current not in self.propagation_graph or not self.propagation_graph[current]:
+                if len(path) > 1:
+                    chains.append(path.copy())
+            else:
+                for next_var in self.propagation_graph[current]:
+                    dfs(next_var, path)
+            
+            path.pop()
+        
+        all_vars = set(self.tainted_vars.keys())
+        vars_with_incoming = set()
+        
+        for targets in self.propagation_graph.values():
+            for target in targets:
+                vars_with_incoming.add(target)
+        
+        sources = all_vars - vars_with_incoming
+        
+        for source in sources:
+            dfs(source, [])
+        
+        return chains
+    
+    def _reset_state(self):
+        """Reset analysis state"""
+        self.tainted_vars.clear()
+        self.vulnerability_paths.clear()
+        self.propagation_graph.clear()
+        self._node_parents.clear()
+        self._direct_source_nodes.clear()

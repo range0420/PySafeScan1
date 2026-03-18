@@ -1,0 +1,9 @@
+name,id
+OS Command Injection,78
+Path Traversal,22
+SQL Injection,89
+Cross Site Scripting,79
+Code Injection,94
+Command Injection,77
+Server-Side Request Forgery (SSRF),918
+Improper Input Validation,20

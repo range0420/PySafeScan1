@@ -1,0 +1,13 @@
+LICENSE
+README.md
+setup.py
+src/ast_analyzer/__init__.py
+src/ast_analyzer/simple_analyzer.py
+src/llm_integration/__init__.py
+src/pysafescan.egg-info/PKG-INFO
+src/pysafescan.egg-info/SOURCES.txt
+src/pysafescan.egg-info/dependency_links.txt
+src/pysafescan.egg-info/entry_points.txt
+src/pysafescan.egg-info/requires.txt
+src/pysafescan.egg-info/top_level.txt
+tests/test_simple.py
